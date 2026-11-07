@@ -1,0 +1,23 @@
+# Python / tooling
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+.venv-win/
+.ipynb_checkpoints/
+
+# Local-only artefacts of opf_sirl (regenerated on each machine)
+opf_sirl/outputs/
+opf_sirl/models/*
+!opf_sirl/models/.gitkeep
+wandb/
+checkpoints/
+
+# Secrets (LLM API key for data synthesis)
+.opf_llm_env
+.env
+
+# OS
+.DS_Store
+Thumbs.db

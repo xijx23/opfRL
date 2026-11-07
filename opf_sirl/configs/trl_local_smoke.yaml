@@ -1,0 +1,31 @@
+# TRL GRPO + Partial-KL, local smoke test on one 8 GB GPU (LoRA, HF generate).
+# Purpose: check that the method and code run end to end; sizes are tiny.
+model_name_or_path: models/Qwen2.5-0.5B-Instruct
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+use_peft: true
+lora_r: 16
+lora_alpha: 32
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+train_file: data/train.parquet
+kl_tag: matlab
+
+output_dir: outputs/trl_grpo_smoke
+learning_rate: 1.0e-5
+beta: 0.0005             # same coefficient as SIRL's kl_ctrl.kl_coef
+epsilon: 0.2             # clip_ratio_low
+epsilon_high: 0.3        # clip_ratio_high
+loss_type: bnpo
+num_generations: 2
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 1
+max_prompt_length: 1536
+max_completion_length: 512
+temperature: 1.0
+gradient_checkpointing: true
+bf16: true
+max_steps: 3
+logging_steps: 1
+save_strategy: "no"
+report_to: none

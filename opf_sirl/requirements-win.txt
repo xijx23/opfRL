@@ -1,0 +1,6 @@
+# Verifier side (Windows + MATLAB R2024b + MATPOWER 8.1), Python 3.12
+# (the R2024b engine does not support Python 3.13).
+matlabengine==24.2.*
+numpy
+requests
+pytest
