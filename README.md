@@ -63,10 +63,14 @@ git submodule update --init --recursive
 - 如果训练服务器没有 MATLAB：在另一台有 MATLAB 的机器上起 verifier，保证网络可达（端口转发 / SSH 隧道等），例如
   `ssh -N -L 8765:127.0.0.1:8765 <matlab-host>` 后用 `OPF_VERIFIER_URL=http://127.0.0.1:8765`。
 
+**安全注意**：verifier 没有认证，会执行收到的任意 MATLAB 代码（`harness.py` 只有一个文本黑名单，挡不住所有危险调用），
+而且执行的是模型生成的代码。不要绑定到公网或共享网段（`0.0.0.0`）；只绑 `127.0.0.1` 并通过 SSH 隧道访问，
+最好用低权限账户运行 MATLAB。
+
 启动与自检：
 
 ```bash
-python scripts/start_verifier.py --host 0.0.0.0 --port 8765 --engines 4   # 在 MATLAB 机器上
+python scripts/start_verifier.py --host 127.0.0.1 --port 8765 --engines 4 # 在 MATLAB 机器上，只绑本机，经 SSH 隧道访问
 python scripts/check_env.py --verifier-url http://<verifier>:8765         # 在训练机器上
 python scripts/verify_benchmark.py --url http://<verifier>:8765           # 期望 210/216 复现（6 个已知例外见 opf_sirl/README）
 ```
