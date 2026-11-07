@@ -18,3 +18,4 @@ cupy-cuda12x<14
 opencv-python-headless<4.12
 requests
 pytest
+tensorboard   # verl's tensorboard logger (training curves in outputs/runs/<run>/tensorboard)

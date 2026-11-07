@@ -18,10 +18,15 @@ OPF/                         <- 本仓库根目录
 └── opf_sirl/                本项目代码（Python 包 opf_sirl + trainers）
     ├── opf_sirl/            核心：prompts / parsing / reward / verifier / synthesis / data
     ├── trainers/            verl_sirl（默认，verl 0.5.0 + REINFORCE++ + Partial-KL）、trl_grpo（备选）
-    ├── configs/             verl_server_7b.sh（服务器正式训练）、verl_local_smoke.sh、trl_local_smoke.yaml
-    ├── scripts/             check_env / start_verifier / verify_benchmark / label_seeds / synthesize /
-    │                        build_dataset / train / evaluate
-    ├── data/                seeds_labelled.jsonl（已标注种子，48 条：L1 39 / L2 7 / L3 1 / L4 1）
+    ├── configs/             verl_server_7b.sh（服务器正式训练）、verl_local_smoke.sh（本机冒烟）、
+    │                        launch_verl.sh（两者共用的启动器：运行目录、记录、日志、汇总）、trl_local_smoke.yaml
+    ├── scripts/             check_env / start_verifier / verify_benchmark      环境与 verifier
+    │                        label_seeds / synthesize / build_dataset           数据
+    │                        train / merge_checkpoint.sh                        训练
+    │                        record_run / summarize_run                         运行记录（launch_verl.sh 自动调用）
+    │                        evaluate / compare_evals                           评测
+    ├── data/                seeds_labelled.jsonl（ProOPF_D 中能运行且收敛的 48 条：L1 39 / L2 7 / L3 1 / L4 1）
+    │                        train.parquet / val.parquet（由这 48 条生成，见"训练数据"）
     ├── models/              空目录，放模型权重或软链接（不入库）
     └── tests/
 ```
@@ -43,10 +48,9 @@ git submodule update --init --recursive
 |---|---|
 | Python 环境 | 按下文"服务器环境"安装；本地的 `.venv-win/` 不入库 |
 | 模型权重 | `opf_sirl/models/` 为空。`verl_server_7b.sh` 默认 `models/Qwen2.5-7B-Instruct`，也可用 `MODEL_PATH` 指定 |
-| `data/train.parquet`、`data/val.parquet` | **还没生成**。需要先合成数据再 `build_dataset.py`（见"当前进度"） |
 | MATLAB verifier | 奖励必须经过 MATLAB + MATPOWER 8.1 执行，服务器只需能访问 verifier 的 HTTP 地址 |
-| LLM API key | 仅数据合成需要，放在 `~/.opf_llm_env`，**不要提交** |
-| `outputs/` | 运行产物（hydra 日志、checkpoint、评测结果），不入库 |
+| LLM API key | 仅数据合成需要（本次实验不用），放在 `~/.opf_llm_env`，**不要提交** |
+| `outputs/` | 运行产物（训练日志、checkpoint、rollout、评测结果），不入库；结构见"结果保存" |
 
 ## 关键依赖：MATLAB verifier
 
@@ -93,8 +97,79 @@ pytest -m "not matlab"                     # 纯 Python 单测
 
 注意：
 - torch 的 CUDA 版本要和服务器驱动匹配；cu128 是为 RTX 50xx 选的，其他卡可换 cu12x 对应 wheel，flash-attn wheel 也要随之匹配。
-- `verl_server_7b.sh` 默认 `VLLM_ATTENTION_BACKEND=XFORMERS`、8 卡、`tensor_model_parallel_size=4`、`trainer.logger=[console,wandb]`
-  （没有 wandb 就追加覆盖 `trainer.logger='[console]'`）。
+- `verl_server_7b.sh` 默认 8 卡、`tensor_model_parallel_size=4`、日志 `[console,tensorboard]`（`OPF_WANDB=1` 时加 wandb）。
+  不再强制 `VLLM_ATTENTION_BACKEND=XFORMERS`：xformers 0.0.30 不接受 flash-attn 2.8，这只换 attention kernel，不影响算法。
+
+## 训练数据（本次实验：只用 ProOPF）
+
+- 训练：ProOPF_D 中能运行且收敛的 48 条（`data/seeds_labelled.jsonl` → `data/train.parquet`），
+  分布 L1 39 / L2 7 / L3 1 / L4 1。ProOPF_D 其余样例的参考代码本身有错（引用不存在的母线/支路、
+  MATPOWER 8.1 不认识的选项、`define_constants; clear;` 等），无法得到标签。
+- 评测：ProOPF_B 全部 124 条（level1–4）+ 3 个 OOD 集，训练中不使用。
+- 训练中不做验证（`test_freq=-1`）；`val.parquet` 只是 verl 要求的占位文件（与 train 相同）。
+- 重新生成：`python scripts/build_dataset.py data/seeds_labelled.jsonl --val-ratio 0`。
+- L3/L4 训练样本各只有 1 条，这两个 level 的提升只能来自迁移；数据合成管线已实现（`synthesize.py`），本次不用。
+
+## 服务器完整实验流程
+
+以下都在 `opf_sirl/` 下执行，`export OPF_VERIFIER_URL=http://<verifier>:8765`。每一步的结果都写到
+`outputs/` 下的独立目录（见"结果保存"）。
+
+```bash
+# 0. 自检：verifier 能复现基准标签（期望 210/216）
+python scripts/check_env.py --verifier-url $OPF_VERIFIER_URL
+python scripts/verify_benchmark.py --url $OPF_VERIFIER_URL
+
+# 1. 7B 基座 baseline（ProOPF_B 全部 + OOD，贪心解码 pass@1）
+python scripts/evaluate.py --model models/Qwen2.5-7B-Instruct --verifier-url $OPF_VERIFIER_URL \
+    --out outputs/eval/base_qwen2.5-7b
+
+# 2. stage-1 训练（SIRL stage-1 奖励 + Partial-KL）
+RUN_NAME=sirl_7b_stage1 bash configs/verl_server_7b.sh
+
+# 3. 合并 checkpoint 并评测
+bash scripts/merge_checkpoint.sh outputs/runs/sirl_7b_stage1
+python scripts/evaluate.py --model outputs/runs/sirl_7b_stage1/hf_model --verifier-url $OPF_VERIFIER_URL \
+    --out outputs/runs/sirl_7b_stage1/eval
+python scripts/summarize_run.py outputs/runs/sirl_7b_stage1          # 把评测结果并入 summary.md
+
+# 4. stage-2 训练（从 stage-1 模型继续，SIRL stage-2 奖励）
+OPF_REWARD_STAGE=2 MODEL_PATH=$PWD/outputs/runs/sirl_7b_stage1/hf_model RUN_NAME=sirl_7b_stage2 \
+    bash configs/verl_server_7b.sh
+bash scripts/merge_checkpoint.sh outputs/runs/sirl_7b_stage2
+python scripts/evaluate.py --model outputs/runs/sirl_7b_stage2/hf_model --verifier-url $OPF_VERIFIER_URL \
+    --out outputs/runs/sirl_7b_stage2/eval
+python scripts/summarize_run.py outputs/runs/sirl_7b_stage2
+
+# 5. 汇总对比表
+python scripts/compare_evals.py base=outputs/eval/base_qwen2.5-7b \
+    stage1=outputs/runs/sirl_7b_stage1/eval stage2=outputs/runs/sirl_7b_stage2/eval \
+    --out outputs/eval/comparison.md
+```
+
+- 训练中断后用同一个 `RUN_NAME` 重跑即从最近的 checkpoint 续训（verl `resume_mode=auto`）。
+- 每步 rollout 数 = 16 prompt × 16 采样 = 256 段代码送 verifier；verifier 引擎数（`--engines`）按 MATLAB 机器的 CPU 核数和
+  license 设大一些（例如 8），否则奖励计算会成为瓶颈（看 `metrics.csv` 里的 `timing_s/reward`）。
+- 7B checkpoint（含优化器状态）每个约 100 GB，只保留最近 2 个（`max_actor_ckpt_to_keep=2`），`save_freq=25`。
+
+## 结果保存
+
+一次训练的所有结果都在 `outputs/runs/<RUN_NAME>/`：
+
+| 文件 | 内容 |
+|---|---|
+| `run_info.json` | git commit / 是否有未提交改动、主机、GPU、包版本、`OPF_*` 环境变量、模型、训练数据各 level 数量、全部 hydra 参数（续训另存 `run_info.resume-<时间>.json`） |
+| `train.log` | verl 完整输出 |
+| `metrics.csv` | 每步全部 verl 指标（从 train.log 解析） |
+| `rollouts/<step>.jsonl` | 每步全部 rollout：prompt、回答、总分、format / executed / correct / instance、level |
+| `rollout_stats.csv` | 每步奖励各分量均值、各 level 正确率 |
+| `tensorboard/` | 训练曲线（`tensorboard --logdir outputs/runs`） |
+| `checkpoints/` | verl FSDP checkpoint |
+| `hf_model/` | 合并后的 HuggingFace 模型（`merge_checkpoint.sh`，`source_step.txt` 记录来源步数） |
+| `eval/` | `evaluate.py` 输出：`predictions.jsonl`（每题回答与得分）、`summary.json`、`summary.md`、`run_info.json` |
+| `summary.md` | 可读总览：设置、训练过程表（抽样步）、评测结果 |
+
+基座评测在 `outputs/eval/base_qwen2.5-7b/`，对比表在 `outputs/eval/comparison.md`。
 
 ## 环境变量
 
@@ -104,7 +179,10 @@ pytest -m "not matlab"                     # 纯 Python 单测
 | `OPF_REWARD_STAGE` | SIRL 奖励阶段 1 或 2 | 1 |
 | `OPF_PARTIAL_KL` | 1 = Partial-KL，0 = 原生全量 KL | 1 |
 | `OPF_PARTIAL_KL_TAG` | KL 区域起始标签（`matlab` 跟 SIRL 代码；`model` 跟论文） | matlab |
-| `MODEL_PATH` / `DATA_DIR` / `CKPT_DIR` | verl 脚本中的模型、数据、checkpoint 路径 | `models/...` / `data` / `outputs/verl` |
+| `MODEL_PATH` / `DATA_DIR` | verl 脚本中的模型、数据路径 | `models/...` / `data` |
+| `RUN_NAME` | 运行名，结果目录 `outputs/runs/$RUN_NAME`；重复使用即续训 | `sirl_7b_stage<阶段>_<时间>` |
+| `TOTAL_EPOCHS` | 训练轮数（48 条 / batch 16 = 每轮 3 步） | 50 |
+| `OPF_WANDB` | 1 = 额外记录到 wandb | 0 |
 | `PROOPF_ROOT` | ProOPF 基准位置 | `../ProOPF_benchmark` |
 | `OPF_DATA_DIR` | 数据目录 | `opf_sirl/data` |
 | `MATPOWER_DIR` | MATPOWER 路径（仅 verifier 机器） | `E:\app\matlab\bin\matpower8.1` |
@@ -116,24 +194,10 @@ pytest -m "not matlab"                     # 纯 Python 单测
 已完成：
 1. 代码框架、两套训练后端、奖励与 verifier 全部实现。
 2. `verify_benchmark.py` 在 ProOPF_B（含 OOD）上 210/216 复现标签。
-3. `data/seeds_labelled.jsonl`：ProOPF_D 种子中能运行且收敛的 48 条。
-4. 本地（RTX 5060 8GB, WSL2, Qwen2.5-0.5B）verl 与 TRL 两个后端各跑通 3 步 smoke test；0.5B 模型奖励全为 0，学习效果需在服务器上用 7B 验证。
+3. 训练数据：ProOPF_D 中 48 条已标注并生成 `data/train.parquet`。
+4. 服务器配置、运行目录与结果记录（`launch_verl.sh` / `record_run.py` / `summarize_run.py`）、
+   checkpoint 合并、评测与对比脚本已就绪；单测通过。
+5. 本地（RTX 5060 8GB, WSL2, Qwen2.5-0.5B）verl 与 TRL 两个后端各跑通过 3 步冒烟测试；0.5B 不会按格式输出，
+   奖励全为 0，学习效果需在服务器上用 7B 验证。
 
-待做（服务器上的顺序）：
-```bash
-cd opf_sirl
-# 1. 合成训练数据（需 verifier + LLM API）；case59/68/189 是 OOD 系统，脚本已自动排除
-source ~/.opf_llm_env && python scripts/synthesize.py --levels 1 2 3 4 --n 500 --url $OPF_VERIFIER_URL
-# 2. 生成 parquet
-python scripts/build_dataset.py data/seeds_labelled.jsonl data/synthetic_L*.jsonl
-# 3. 训练前基线
-python scripts/evaluate.py --model models/Qwen2.5-7B-Instruct --verifier-url $OPF_VERIFIER_URL --out outputs/eval_base
-# 4. stage-1 训练
-OPF_VERIFIER_URL=... bash configs/verl_server_7b.sh
-# 5. 合并 stage-1 checkpoint（python -m verl.model_merger merge --backend fsdp ...），再 stage-2
-OPF_REWARD_STAGE=2 MODEL_PATH=<merged stage-1> OPF_VERIFIER_URL=... bash configs/verl_server_7b.sh
-# 6. 评测训练后模型
-python scripts/evaluate.py --model <merged checkpoint> --verifier-url $OPF_VERIFIER_URL --out outputs/eval_stage2
-```
-
-合成数据和 parquet 体积不大，生成后可以提交回仓库，方便复现。
+待做：按"服务器完整实验流程"执行。

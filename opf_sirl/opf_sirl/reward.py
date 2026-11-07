@@ -54,7 +54,8 @@ def score_one(response: str, ground_truth, meta: dict, result: Optional[ExecResu
         score = fmt * cfg.format_score + executed * cfg.exec_score + correct * cfg.answer_score
     else:
         score = executed * cfg.exec_score + correct * cfg.answer_score + instance * correct * cfg.instance_score
-    return {"score": score, "format": fmt, "executed": executed, "correct": correct, "instance": instance}
+    return {"score": score, "format": fmt, "executed": executed, "correct": correct, "instance": instance,
+            "level": meta["level"]}
 
 
 def compute_score(data_sources, solution_strs: List[str], ground_truths, extra_infos,

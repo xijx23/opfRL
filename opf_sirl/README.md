@@ -31,9 +31,15 @@ Implementation notes
   With that, `scripts/verify_benchmark.py` reproduces 210/216 ProOPF_B labels (incl. OOD). The 6 exceptions:
   3 level-2 records have no strategy values in the benchmark itself (ProOPF's own tester cannot run them either),
   and 3 OOD case189 AC-OPF objectives differ by 1–2 % (likely a local optimum / MATPOWER version difference).
-* **ProOPF_D is noisy.** Many of its reference programs do not run (missing `define_constants`, options unknown
-  to MATPOWER 8.1, non-existent buses, MINLP). `label_seeds.py` keeps only runnable, converged seeds
-  (39/7/1/1 for levels 1–4); levels 2–4 rely mainly on synthesized data.
+* **ProOPF_D is noisy.** Many of its reference programs do not run: `define_constants; clear;` wipes the
+  column names, options unknown to MATPOWER 8.1, buses/branches that do not exist in the case, MINLP, and
+  level-2/4 modifications whose target does not exist or has default 0. `label_seeds.py` keeps only runnable,
+  converged seeds: **48 = 39/7/1/1 for levels 1–4** (`data/seeds_labelled.jsonl`). Removing the `clear` lines
+  was tried and recovers none (those programs then fail on the missing buses/branches), so it is not applied.
+* **Training data = ProOPF only.** The current experiment trains on these 48 ProOPF_D seeds
+  (`data/train.parquet`) and evaluates on all of ProOPF_B (124) + the three OOD sets. Levels 3/4 have one
+  training prompt each, so improvements there must come from transfer. The synthesis pipeline
+  (`opf_sirl/synthesis/`) is implemented and tested but not used for this experiment.
 * **Synthesized level-2/4 requests** must mention the modifications in spec order, because that order is the
   positional argument order of `run_opf`; back-translation checks the order.
 
@@ -47,16 +53,44 @@ opf_sirl/            framework-independent core
   verifier/          harness (code -> MATLAB program), MATLAB engine pool, HTTP server/client
   reward.py          compute_score(...) with verl's batch reward signature
   instance.py        stage-2 instance-level comparison
+  run_info.py        provenance (git commit, GPUs, package versions, env) for run_info.json
   synthesis/         seed labelling, spec sampling, code templates, LLM writer, pipeline
 trainers/
   partial_kl.py      shared partial-KL mask
   verl_sirl/         default back-end (SIRL original: verl + REINFORCE++ + Partial-KL)
   trl_grpo/          alternative back-end (TRL GRPO + Partial-KL)
-configs/             verl_local_smoke.sh, verl_server_7b.sh, trl_local_smoke.yaml
-scripts/             check_env, start_verifier, verify_benchmark, label_seeds, synthesize,
-                     build_dataset, train, evaluate
+configs/
+  verl_server_7b.sh  server training (hyper-parameters only)
+  verl_local_smoke.sh  local 8 GB smoke test (hyper-parameters only)
+  launch_verl.sh     shared launcher: run directory, run_info.json, train.log, summary
+  trl_local_smoke.yaml
+scripts/
+  check_env, start_verifier, verify_benchmark      environment / verifier
+  label_seeds, synthesize, build_dataset           data
+  train, merge_checkpoint.sh                       training
+  record_run, summarize_run                        run records (called by launch_verl.sh)
+  evaluate, compare_evals                          evaluation
 tests/               unit tests (+ `-m matlab` integration tests)
 ```
+
+## Run outputs
+
+A verl run writes everything to `outputs/runs/<RUN_NAME>/` (re-running with the same `RUN_NAME` resumes):
+
+| file | content |
+|---|---|
+| `run_info.json` | git commit / dirty flag, host, GPUs, package versions, `OPF_*` env, model, train/val sizes per level, every hydra override (resumes add `run_info.resume-<time>.json`) |
+| `train.log` | full console output of verl |
+| `metrics.csv` | every verl metric per step (parsed from `train.log`) |
+| `rollouts/<step>.jsonl` | every rollout: prompt, response, score, format / executed / correct / instance, level |
+| `rollout_stats.csv` | per step: mean reward components and pass rate per level |
+| `tensorboard/` | training curves (`tensorboard --logdir outputs/runs`) |
+| `checkpoints/` | verl FSDP checkpoints (last 2 kept on the server) |
+| `hf_model/` | merged HuggingFace model (`scripts/merge_checkpoint.sh`) |
+| `eval/` | `scripts/evaluate.py` output: `predictions.jsonl`, `summary.json`, `summary.md`, `run_info.json` |
+| `summary.md` | readable overview: setup, training table, evaluation (re-run `scripts/summarize_run.py` after eval) |
+
+`scripts/compare_evals.py` puts several `eval/` results (e.g. base vs. stage 1 vs. stage 2) in one table.
 
 ## Setup
 
@@ -97,20 +131,16 @@ ln -s ~/models/Qwen2.5-0.5B-Instruct models/Qwen2.5-0.5B-Instruct
 .venv-win\Scripts\python scripts/start_verifier.py --host 172.28.0.1 --port 8765 --engines 3
 # 2. check that the reference code reproduces the ProOPF labels
 python scripts/verify_benchmark.py --url http://<win-host>:8765
-# 3. label ProOPF_D seeds, synthesize, build parquet
-python scripts/label_seeds.py --url http://<win-host>:8765
-source ~/.opf_llm_env && python scripts/synthesize.py --n 500 --url http://<win-host>:8765
-python scripts/build_dataset.py data/seeds_labelled.jsonl data/synthetic_L*.jsonl
-# 4. baseline
-python scripts/evaluate.py --model models/Qwen2.5-0.5B-Instruct --verifier-url http://<win-host>:8765
-# 5. local smoke tests (3 steps each; check that the pipeline runs, not that the model learns)
+# 3. data (ProOPF only): label the ProOPF_D seeds, all of them go to training
+python scripts/label_seeds.py --url http://<win-host>:8765          # -> data/seeds_labelled.jsonl (committed)
+python scripts/build_dataset.py data/seeds_labelled.jsonl --val-ratio 0
+# 4. local smoke tests (3 steps each; check that the pipeline runs, not that the model learns)
 OPF_VERIFIER_URL=http://<win-host>:8765 python scripts/train.py --backend verl --config configs/verl_local_smoke.sh
 OPF_VERIFIER_URL=http://<win-host>:8765 python scripts/train.py --backend trl  --config configs/trl_local_smoke.yaml
-# 6. server training (stage 1, then stage 2 from the merged stage-1 checkpoint)
-OPF_VERIFIER_URL=http://<matlab-host>:8765 bash configs/verl_server_7b.sh
-OPF_REWARD_STAGE=2 MODEL_PATH=<merged stage-1 checkpoint> OPF_VERIFIER_URL=... bash configs/verl_server_7b.sh
-# 7. evaluate the trained model (verl checkpoints: python -m verl.model_merger merge --backend fsdp ... first)
 ```
+
+The full server experiment (7B baseline, stage 1, stage 2, evaluation) is described step by step in the
+[repository README](../README.md).
 
 The verifier can run on any machine with MATLAB + MATPOWER (Windows or Linux); the trainer only needs its URL.
 

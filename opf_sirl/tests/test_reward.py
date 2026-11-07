@@ -35,6 +35,7 @@ def test_stage1_combines_format_execution_and_answer():
     responses = [RESPONSE.format(code="% GOOD"), RESPONSE.format(code="% bad"), "no code"]
     out = compute_score(None, responses, [100.0] * 3, [_extra()] * 3, stage=1, executor=ex)
     assert [o["score"] for o in out] == [2.5, 0.5, 0.0]
+    assert all(o["level"] == 1 for o in out)  # kept in verl's rollout dumps for per-level statistics
     assert len(ex.programs) == 2  # unparsable responses are not executed
 
 
