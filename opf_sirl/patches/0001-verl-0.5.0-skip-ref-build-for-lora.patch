@@ -1,0 +1,11 @@
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -627,7 +627,7 @@
+                 trust_remote_code=self.config.model.get("trust_remote_code", False)
+             )
+ 
+-        if self._is_ref:
++        if self._is_ref and not self._is_lora:
+             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+             self.ref_module_fsdp = self._build_model_optimizer(
+                 model_path=local_path,
